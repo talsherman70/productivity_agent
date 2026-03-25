@@ -1,5 +1,7 @@
 import json
 from app.core.llm_client import LLMClient
+from app.core.utils import parse_llm_json
+
 
 PLANNER_SYSTEM_PROMPT = """
 You are a productivity planner agent. Your job is to take a user's goal 
@@ -53,20 +55,4 @@ class PlannerAgent:
         return self._parse_response(raw_response)
 
     def _parse_response(self, raw_response: str) -> dict:
-        """
-        Parses Claude's response into a Python dictionary.
-        If parsing fails, returns an error dictionary instead of crashing.
-        """
-        try:
-            # Remove markdown code blocks if Claude added them
-            cleaned = raw_response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-            return json.loads(cleaned.strip())
-        except json.JSONDecodeError:
-            return {
-                "error": "Planner failed to return valid JSON",
-                "raw_response": raw_response
-            }
+        return parse_llm_json(raw_response)

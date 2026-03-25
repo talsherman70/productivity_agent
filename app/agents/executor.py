@@ -1,4 +1,5 @@
 import json
+from app.core.utils import parse_llm_json
 from app.core.llm_client import LLMClient
 from app.tools.productivity import (
     validate_plan,
@@ -92,23 +93,4 @@ Based on these tool results, provide your execution report.
         return self._parse_response(raw_response)
 
     def _parse_response(self, raw_response: str) -> dict:
-        """
-        Parses Claude's response, handling markdown code blocks if present.
-        """
-        try:
-            cleaned = raw_response.strip()
-            if "```" in cleaned:
-                parts = cleaned.split("```")
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("json"):
-                        part = part[4:].strip()
-                    if part.startswith("{"):
-                        cleaned = part
-                        break
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            return {
-                "error": "Executor failed to return valid JSON",
-                "raw_response": raw_response
-            }
+        return parse_llm_json(raw_response)
