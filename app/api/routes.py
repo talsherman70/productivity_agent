@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
+from app.orchestrator.coordinator import Orchestrator
 
 router = APIRouter()
 
@@ -19,11 +20,6 @@ class AgentResponse(BaseModel):
 
 @router.post("/run", response_model=AgentResponse)
 def run_agent(request: AgentRequest):
-    # Placeholder — will be wired to the orchestrator in Phase 7
-    return AgentResponse(
-        status="ok",
-        plan=[],
-        execution_results=[],
-        critique="",
-        final_summary=f"Received your goal: '{request.goal}'. Agents not yet connected."
-    )
+    orchestrator = Orchestrator()
+    result = orchestrator.run(goal=request.goal, context=request.context)
+    return AgentResponse(**result)
