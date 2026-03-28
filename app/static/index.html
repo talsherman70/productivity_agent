@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Productivity Agent</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f0f2f5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #app {
+      width: 100%;
+      max-width: 720px;
+      height: 90vh;
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    #header {
+      padding: 18px 24px;
+      background: #1a1a2e;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #header .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #4ade80;
+    }
+
+    #header h1 { font-size: 17px; font-weight: 600; }
+    #header span { font-size: 13px; color: #94a3b8; margin-left: auto; }
+
+    /* ── Messages ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .bubble-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+    }
+
+    .bubble-row.user { flex-direction: row-reverse; }
+
+    .avatar {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+
+    .avatar.bot  { background: #1a1a2e; color: #fff; }
+    .avatar.user { background: #6366f1; color: #fff; }
+
+    .bubble {
+      max-width: 75%;
+      padding: 12px 16px;
+      border-radius: 18px;
+      font-size: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .bubble.bot {
+      background: #f1f5f9;
+      color: #1e293b;
+      border-bottom-left-radius: 4px;
+    }
+
+    .bubble.user {
+      background: #6366f1;
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    /* ── Plan card ── */
+    .plan-card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+
+    .plan-card-header {
+      background: #1a1a2e;
+      color: #fff;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .plan-task {
+      padding: 10px 14px;
+      border-bottom: 1px solid #f1f5f9;
+      font-size: 13px;
+    }
+
+    .plan-task:last-child { border-bottom: none; }
+
+    .plan-task-title {
+      font-weight: 600;
+      color: #1e293b;
+      margin-bottom: 2px;
+    }
+
+    .plan-task-meta {
+      color: #64748b;
+      font-size: 12px;
+    }
+
+    .priority-high   { color: #ef4444; font-weight: 600; }
+    .priority-medium { color: #f59e0b; font-weight: 600; }
+    .priority-low    { color: #22c55e; font-weight: 600; }
+
+    .summary-block {
+      background: #f8fafc;
+      border-top: 1px solid #e2e8f0;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #475569;
+      white-space: pre-wrap;
+    }
+
+    /* ── Typing indicator ── */
+    .typing {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 14px 16px;
+      background: #f1f5f9;
+      border-radius: 18px;
+      border-bottom-left-radius: 4px;
+      width: fit-content;
+    }
+
+    .typing span {
+      width: 7px; height: 7px;
+      background: #94a3b8;
+      border-radius: 50%;
+      animation: bounce 1.2s infinite;
+    }
+
+    .typing span:nth-child(2) { animation-delay: 0.2s; }
+    .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30%            { transform: translateY(-6px); }
+    }
+
+    /* ── Input bar ── */
+    #input-area {
+      padding: 16px 20px;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      gap: 10px;
+      background: #fff;
+    }
+
+    #input-area input {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1px solid #e2e8f0;
+      border-radius: 24px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    #input-area input:focus { border-color: #6366f1; }
+
+    #input-area button {
+      padding: 12px 22px;
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 24px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    #input-area button:hover    { background: #4f46e5; }
+    #input-area button:disabled { background: #c7d2fe; cursor: not-allowed; }
+
+    /* ── Status bar ── */
+    #status {
+      text-align: center;
+      padding: 6px;
+      font-size: 11px;
+      color: #94a3b8;
+      background: #f8fafc;
+      border-top: 1px solid #f1f5f9;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <div class="dot"></div>
+    <h1>Productivity Agent</h1>
+    <span id="session-label">Starting session...</span>
+  </div>
+
+  <div id="messages"></div>
+
+  <div id="input-area">
+    <input id="msg-input" type="text" placeholder="Describe a goal or ask a question..." disabled />
+    <button id="send-btn" disabled>Send</button>
+  </div>
+
+  <div id="status">Connecting...</div>
+</div>
+
+<script>
+  let sessionId = null;
+
+  const messagesEl  = document.getElementById("messages");
+  const input       = document.getElementById("msg-input");
+  const sendBtn     = document.getElementById("send-btn");
+  const statusEl    = document.getElementById("status");
+  const sessionLabel = document.getElementById("session-label");
+
+  // ── Start session on page load ──────────────────────────────────────────────
+  async function startSession() {
+    try {
+      const res  = await fetch("/chat/new", { method: "POST" });
+      const data = await res.json();
+      sessionId  = data.session_id;
+
+      sessionLabel.textContent = "Session: " + sessionId.slice(0, 8) + "...";
+      statusEl.textContent = "Connected · Session active";
+
+      input.disabled  = false;
+      sendBtn.disabled = false;
+      input.focus();
+
+      addBotBubble(
+        "Hi! I'm your productivity assistant.\n\n" +
+        "Tell me a goal you're working on — like:\n" +
+        "• \"Prepare for a Python job interview next week\"\n" +
+        "• \"Plan a fitness routine for the next month\"\n\n" +
+        "I'll build a full action plan for you."
+      );
+    } catch (e) {
+      statusEl.textContent = "Failed to connect to server.";
+      addBotBubble("Could not connect to the server. Make sure it's running.");
+    }
+  }
+
+  // ── Send a message ──────────────────────────────────────────────────────────
+  async function sendMessage() {
+    const text = input.value.trim();
+    if (!text || !sessionId) return;
+
+    addUserBubble(text);
+    input.value = "";
+    input.disabled  = true;
+    sendBtn.disabled = true;
+
+    const typingId = addTyping();
+
+    try {
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, message: text })
+      });
+
+      removeTyping(typingId);
+
+      if (!res.ok) {
+        const err = await res.json();
+        addBotBubble("Error: " + (err.detail || "Something went wrong."));
+      } else {
+        const data = await res.json();
+        addBotBubble(data.assistant_message, data.structured_data);
+      }
+    } catch (e) {
+      removeTyping(typingId);
+      addBotBubble("Network error. Is the server running?");
+    }
+
+    input.disabled   = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+
+  // ── Bubble builders ─────────────────────────────────────────────────────────
+  function addUserBubble(text) {
+    const row = document.createElement("div");
+    row.className = "bubble-row user";
+    row.innerHTML = `
+      <div class="avatar user">You</div>
+      <div class="bubble user">${escHtml(text)}</div>
+    `;
+    messagesEl.appendChild(row);
+    scrollBottom();
+  }
+
+  function addBotBubble(text, structuredData = null) {
+    const row = document.createElement("div");
+    row.className = "bubble-row";
+
+    let planHtml = "";
+    if (structuredData && structuredData.plan && structuredData.plan.length > 0) {
+      planHtml = buildPlanCard(structuredData);
+    }
+
+    row.innerHTML = `
+      <div class="avatar bot">AI</div>
+      <div>
+        <div class="bubble bot">${escHtml(text)}</div>
+        ${planHtml}
+      </div>
+    `;
+    messagesEl.appendChild(row);
+    scrollBottom();
+  }
+
+  function buildPlanCard(data) {
+    const tasks = data.plan || [];
+    const summary = data.final_summary || "";
+
+    const taskRows = tasks.map(t => {
+      const mins  = t.estimated_minutes ? `${t.estimated_minutes} min` : "";
+      const pri   = t.priority || "";
+      const priClass = `priority-${pri}`;
+      return `
+        <div class="plan-task">
+          <div class="plan-task-title">${escHtml(t.title || "")}</div>
+          <div class="plan-task-meta">
+            ${mins ? `⏱ ${mins}` : ""}
+            ${pri  ? `&nbsp;·&nbsp;<span class="${priClass}">${pri} priority</span>` : ""}
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    return `
+      <div class="plan-card">
+        <div class="plan-card-header">📋 Action Plan — ${tasks.length} tasks</div>
+        ${taskRows}
+        ${summary ? `<div class="summary-block">${escHtml(summary)}</div>` : ""}
+      </div>
+    `;
+  }
+
+  // ── Typing indicator ────────────────────────────────────────────────────────
+  let typingCounter = 0;
+
+  function addTyping() {
+    const id  = "typing-" + (++typingCounter);
+    const row = document.createElement("div");
+    row.className = "bubble-row";
+    row.id = id;
+    row.innerHTML = `
+      <div class="avatar bot">AI</div>
+      <div class="typing"><span></span><span></span><span></span></div>
+    `;
+    messagesEl.appendChild(row);
+    scrollBottom();
+    return id;
+  }
+
+  function removeTyping(id) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function scrollBottom() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // ── Event listeners ─────────────────────────────────────────────────────────
+  sendBtn.addEventListener("click", sendMessage);
+
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // ── Boot ─────────────────────────────────────────────────────────────────────
+  startSession();
+</script>
+</body>
+</html>

@@ -17,7 +17,8 @@ class LLMClient:
 
     def chat(self, system_prompt: str, user_message: str) -> str:
         """
-        Send a message to Claude and get a response back.
+        Send a single message to Claude and get a response back.
+        Used by the original Planner, Executor, and Critic agents.
 
         system_prompt: instructions that define how Claude should behave
         user_message: the actual input for this specific call
@@ -28,6 +29,24 @@ class LLMClient:
             messages=[
                 {"role": "user", "content": user_message}
             ],
+            system=system_prompt
+        )
+
+        return response.content[0].text
+
+    def chat_with_history(self, system_prompt: str, messages: list) -> str:
+        """
+        Send a full conversation history to Claude and get a response back.
+        Used by the ConversationalOrchestrator so Claude can see all prior messages.
+
+        system_prompt: instructions that define how Claude should behave
+        messages: the full list of {"role": ..., "content": ...} dicts
+                  produced by ConversationHistory.get_messages()
+        """
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=2000,
+            messages=messages,
             system=system_prompt
         )
 
