@@ -6,14 +6,14 @@ load_dotenv()
 
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, model: str = "claude-opus-4-6"):
         api_key = os.getenv("ANTHROPIC_API_KEY")
 
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env file")
 
         self.client = Anthropic(api_key=api_key)
-        self.model = "claude-opus-4-6"
+        self.model = model
 
     def chat(self, system_prompt: str, user_message: str) -> str:
         """

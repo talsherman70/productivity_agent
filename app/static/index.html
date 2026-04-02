@@ -48,6 +48,20 @@
     #header h1 { font-size: 17px; font-weight: 600; }
     #header span { font-size: 13px; color: #94a3b8; margin-left: auto; }
 
+    #new-chat-btn {
+      padding: 7px 14px;
+      background: transparent;
+      color: #94a3b8;
+      border: 1px solid #94a3b8;
+      border-radius: 20px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+
+    #new-chat-btn:hover { background: #ffffff18; color: #fff; border-color: #fff; }
+
     /* ── Messages ── */
     #messages {
       flex: 1;
@@ -97,55 +111,6 @@
       background: #6366f1;
       color: #fff;
       border-bottom-right-radius: 4px;
-    }
-
-    /* ── Plan card ── */
-    .plan-card {
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      margin-top: 10px;
-      overflow: hidden;
-    }
-
-    .plan-card-header {
-      background: #1a1a2e;
-      color: #fff;
-      padding: 10px 14px;
-      font-size: 13px;
-      font-weight: 600;
-    }
-
-    .plan-task {
-      padding: 10px 14px;
-      border-bottom: 1px solid #f1f5f9;
-      font-size: 13px;
-    }
-
-    .plan-task:last-child { border-bottom: none; }
-
-    .plan-task-title {
-      font-weight: 600;
-      color: #1e293b;
-      margin-bottom: 2px;
-    }
-
-    .plan-task-meta {
-      color: #64748b;
-      font-size: 12px;
-    }
-
-    .priority-high   { color: #ef4444; font-weight: 600; }
-    .priority-medium { color: #f59e0b; font-weight: 600; }
-    .priority-low    { color: #22c55e; font-weight: 600; }
-
-    .summary-block {
-      background: #f8fafc;
-      border-top: 1px solid #e2e8f0;
-      padding: 10px 14px;
-      font-size: 12px;
-      color: #475569;
-      white-space: pre-wrap;
     }
 
     /* ── Typing indicator ── */
@@ -228,6 +193,7 @@
     <div class="dot"></div>
     <h1>Productivity Agent</h1>
     <span id="session-label">Starting session...</span>
+    <button id="new-chat-btn">+ New Chat</button>
   </div>
 
   <div id="messages"></div>
@@ -302,7 +268,7 @@
         addBotBubble("Error: " + (err.detail || "Something went wrong."));
       } else {
         const data = await res.json();
-        addBotBubble(data.assistant_message, data.structured_data);
+        addBotBubble(data.assistant_message);
       }
     } catch (e) {
       removeTyping(typingId);
@@ -326,52 +292,15 @@
     scrollBottom();
   }
 
-  function addBotBubble(text, structuredData = null) {
+  function addBotBubble(text) {
     const row = document.createElement("div");
     row.className = "bubble-row";
-
-    let planHtml = "";
-    if (structuredData && structuredData.plan && structuredData.plan.length > 0) {
-      planHtml = buildPlanCard(structuredData);
-    }
-
     row.innerHTML = `
       <div class="avatar bot">AI</div>
-      <div>
-        <div class="bubble bot">${escHtml(text)}</div>
-        ${planHtml}
-      </div>
+      <div class="bubble bot">${escHtml(text)}</div>
     `;
     messagesEl.appendChild(row);
     scrollBottom();
-  }
-
-  function buildPlanCard(data) {
-    const tasks = data.plan || [];
-    const summary = data.final_summary || "";
-
-    const taskRows = tasks.map(t => {
-      const mins  = t.estimated_minutes ? `${t.estimated_minutes} min` : "";
-      const pri   = t.priority || "";
-      const priClass = `priority-${pri}`;
-      return `
-        <div class="plan-task">
-          <div class="plan-task-title">${escHtml(t.title || "")}</div>
-          <div class="plan-task-meta">
-            ${mins ? `⏱ ${mins}` : ""}
-            ${pri  ? `&nbsp;·&nbsp;<span class="${priClass}">${pri} priority</span>` : ""}
-          </div>
-        </div>
-      `;
-    }).join("");
-
-    return `
-      <div class="plan-card">
-        <div class="plan-card-header">📋 Action Plan — ${tasks.length} tasks</div>
-        ${taskRows}
-        ${summary ? `<div class="summary-block">${escHtml(summary)}</div>` : ""}
-      </div>
-    `;
   }
 
   // ── Typing indicator ────────────────────────────────────────────────────────
@@ -409,6 +338,17 @@
       .replace(/"/g, "&quot;");
   }
 
+  // ── New Chat button ──────────────────────────────────────────────────────────
+  async function resetChat() {
+    messagesEl.innerHTML = "";
+    input.disabled   = true;
+    sendBtn.disabled = true;
+    sessionId        = null;
+    sessionLabel.textContent = "Starting session...";
+    statusEl.textContent     = "Connecting...";
+    await startSession();
+  }
+
   // ── Event listeners ─────────────────────────────────────────────────────────
   sendBtn.addEventListener("click", sendMessage);
 
@@ -418,6 +358,8 @@
       sendMessage();
     }
   });
+
+  document.getElementById("new-chat-btn").addEventListener("click", resetChat);
 
   // ── Boot ─────────────────────────────────────────────────────────────────────
   startSession();

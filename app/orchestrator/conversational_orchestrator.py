@@ -14,20 +14,25 @@ Read the conversation history and classify the user's latest message.
 
 Respond with ONLY a valid JSON object — no extra text:
 {
-    "intent": "new_goal" | "confirmation" | "rejection" | "refinement" | "question" | "other",
+    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "question" | "other",
     "goal": "the user's productivity goal if one exists anywhere in the conversation, otherwise empty string",
-    "context": "any useful context from the conversation such as time constraints or preferences, otherwise empty string"
+    "context": "any useful context gathered from the full conversation (preferences, constraints, answers to questions), otherwise empty string"
 }
 
 Intent definitions:
-- new_goal: the user is describing a new task, goal, or project they want a plan for
+- new_goal: the user described a goal AND you have enough context to act on it (e.g. planning a study schedule with a deadline)
+- needs_context: the user wants something done but key information is missing before you can help (e.g. booking a restaurant without knowing cuisine, people count, or area — you need to ask)
 - confirmation: the user is agreeing to proceed (yes, go ahead, sure, do it, ok, sounds good, etc.)
 - rejection: the user is saying no, cancel, stop, or don't do that
 - refinement: the user wants to change or adjust the current goal or plan
 - question: the user is asking a question about the plan or the assistant
 - other: greetings, thanks, unrelated messages
 
-Always extract the most recent active goal from the full conversation history.
+Key rule: if the user wants to BOOK, SCHEDULE, FIND, or DO something in the real world and you are missing
+key details (what type, how many people, where, when, preferences), classify as needs_context, not new_goal.
+Only classify as new_goal when you have enough to actually help.
+
+Always extract the most recent active goal and accumulate context from the full conversation history.
 """
 
 CONVERSATIONAL_SYSTEM_PROMPT = """
@@ -36,7 +41,8 @@ You are a helpful productivity assistant. You help users plan, organize, and ach
 Be warm, clear, and concise. Do not use filler phrases like "Certainly!" or "Of course!".
 Get straight to the point.
 
-When a user describes a goal, ask for confirmation before building a full plan.
+When you need more information before you can help, ask ONE specific question at a time.
+Never ask multiple questions at once. Wait for the answer before asking the next one.
 When a user says no or rejects something, acknowledge it briefly and ask what they'd like instead.
 When asked a question, answer it directly.
 """
@@ -63,7 +69,10 @@ class ConversationalOrchestrator:
     def __init__(self, store: AbstractSessionStore = None):
         # Use the provided store, or fall back to the global singleton
         self.store = store or default_store
-        self.llm = LLMClient()
+        # Haiku for everything conversational — fast, feels instant
+        self.llm = LLMClient(model="claude-haiku-4-5-20251001")
+        # Also Haiku for intent detection
+        self.fast_llm = LLMClient(model="claude-haiku-4-5-20251001")
         self.pipeline = Orchestrator()
 
     def run(self, session_id: str, user_message: str) -> dict:
@@ -91,17 +100,20 @@ class ConversationalOrchestrator:
         context = intent_data.get("context", "").strip()
 
         # Step 3: Route to the right handler
-        if intent == "new_goal" and goal:
-            response = self._handle_new_goal(goal)
+        if intent in ("new_goal", "confirmation") and goal:
+            # Have enough context — run the pipeline immediately
+            response = self._handle_pipeline(goal, context)
 
-        elif intent == "confirmation" and goal:
-            response = self._handle_confirmation(goal, context)
+        elif intent == "needs_context":
+            # Missing key info — ask one clarifying question
+            response = self._handle_other(history)
 
         elif intent == "rejection":
             response = self._handle_rejection(history)
 
         elif intent == "refinement" and goal:
-            response = self._handle_refinement(goal)
+            # Treat refinement as a new pipeline run with the updated goal
+            response = self._handle_pipeline(goal, context)
 
         else:
             # Covers: questions, greetings, refinement with no goal, other
@@ -122,7 +134,7 @@ class ConversationalOrchestrator:
         Returns a dict with 'intent', 'goal', and 'context'.
         Falls back to {"intent": "other"} if parsing fails.
         """
-        raw = self.llm.chat_with_history(
+        raw = self.fast_llm.chat_with_history(
             system_prompt=INTENT_SYSTEM_PROMPT,
             messages=history.get_messages()
         )
@@ -133,53 +145,29 @@ class ConversationalOrchestrator:
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
-    def _handle_new_goal(self, goal: str) -> dict:
+    def _handle_pipeline(self, goal: str, context: str) -> dict:
         """
-        User described a new goal.
-        Ask for confirmation before running the expensive pipeline.
-        """
-        return {
-            "assistant_message": (
-                f"Got it! I'll build a full productivity plan for:\n\"{goal}\"\n\n"
-                "Shall I go ahead? Reply 'yes' to proceed, or tell me if you'd like to adjust anything."
-            ),
-            "structured_data": None,
-            "action": "awaiting_confirmation"
-        }
-
-    def _handle_confirmation(self, goal: str, context: str) -> dict:
-        """
-        User confirmed. Run the full Planner→Executor→Critic pipeline.
-        This is the only place the pipeline is called from the chat flow.
+        Runs the Planner → Executor pipeline and returns a clean numbered list response.
+        Called for new goals, confirmations, and refinements.
         """
         result = self.pipeline.run(goal=goal, context=context)
 
         if result.get("status") == "error":
             return {
-                "assistant_message": (
-                    f"Something went wrong while building your plan.\n"
-                    f"{result.get('final_summary', '')}"
-                ),
+                "assistant_message": "Something went wrong building your plan. Try again?",
                 "structured_data": None,
                 "action": "error"
             }
 
         tasks = result.get("plan", [])
-        first_task = tasks[0].get("title", "") if tasks else ""
-        critique = result.get("critique", "")
-
-        lines = [f"Here's your plan — {len(tasks)} tasks ready to go."]
-        if first_task:
-            lines.append(f"Start with: {first_task}")
-        lines.append("\nLet me know if you'd like to adjust anything.")
+        numbered = "\n".join(f"{i+1}. {t.get('title', '')}" for i, t in enumerate(tasks))
+        message = f"Here's what I came up with:\n\n{numbered}"
 
         return {
-            "assistant_message": "\n".join(lines),
+            "assistant_message": message,
             "structured_data": {
-                "plan": result.get("plan"),
+                "plan": tasks,
                 "execution_results": result.get("execution_results"),
-                "critique": result.get("critique"),
-                "final_summary": result.get("final_summary")
             },
             "action": "plan_delivered"
         }
@@ -196,19 +184,6 @@ class ConversationalOrchestrator:
             "assistant_message": raw,
             "structured_data": None,
             "action": "rejected"
-        }
-
-    def _handle_refinement(self, updated_goal: str) -> dict:
-        """
-        User wants to change the goal. Acknowledge and ask for confirmation again.
-        """
-        return {
-            "assistant_message": (
-                f"Got it, I'll adjust the goal to:\n\"{updated_goal}\"\n\n"
-                "Shall I go ahead with this updated version?"
-            ),
-            "structured_data": None,
-            "action": "awaiting_confirmation"
         }
 
     def _handle_other(self, history: ConversationHistory) -> dict:
