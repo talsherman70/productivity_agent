@@ -114,7 +114,7 @@ class CalendarService:
             title = event.get("summary", "Untitled")
             start = event["start"].get("dateTime", event["start"].get("date", ""))
             if "T" in start:
-                formatted_time = datetime.fromisoformat(start).strftime("%a %b %d at %H:%M")
+                formatted_time = datetime.fromisoformat(start).astimezone(self.tz).strftime("%a %b %d at %H:%M")
             else:
                 formatted_time = start
             lines.append(f"- {title}: {formatted_time}")
@@ -125,7 +125,7 @@ class CalendarService:
         title = event.get("summary", "Event")
         start = event["start"].get("dateTime", "")
         if start:
-            dt = datetime.fromisoformat(start)
+            dt = datetime.fromisoformat(start).astimezone(self.tz)
             return f"{title} on {dt.strftime('%a %b %d at %H:%M')}"
         return title
 

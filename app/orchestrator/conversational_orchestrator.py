@@ -9,19 +9,15 @@ from app.orchestrator.coordinator import Orchestrator
 # ── System prompts ────────────────────────────────────────────────────────────
 
 def get_intent_system_prompt() -> str:
-    """
-    Returns the intent detection prompt with today's date injected.
-    This allows the model to correctly parse relative dates like 'tomorrow'.
-    """
     today = datetime.now().strftime("%Y-%m-%d")
     return f"""
-You are a conversation router for a productivity assistant with Google Calendar access.
+You are a conversation router for a productivity assistant with Google Calendar and Google Places access.
 
 Read the conversation history and classify the user's latest message.
 
 Respond with ONLY a valid JSON object — no extra text:
 {{
-    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "check_calendar" | "question" | "other",
+    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "question" | "other",
     "goal": "the user's productivity goal if one exists, otherwise empty string",
     "context": "any useful context from the full conversation (preferences, constraints, answers), otherwise empty string",
     "calendar_event": {{
@@ -29,25 +25,46 @@ Respond with ONLY a valid JSON object — no extra text:
         "date": "YYYY-MM-DD",
         "time": "HH:MM",
         "duration_minutes": 60
-    }}
+    }},
+    "delete_query": {{
+        "title": "partial or full title of the event to delete",
+        "date": "YYYY-MM-DD or empty string if not specified"
+    }},
+    "places_query": {{
+        "query": "what the user is looking for (e.g. Italian restaurant)",
+        "location": "where to search (e.g. Tel Aviv) — empty string if not specified",
+        "nearby": false,
+        "radius_meters": 2000
+    }},
+    "selected_place_index": null
 }}
 
 Intent definitions:
-- new_goal: user described a goal with enough context to build a plan
+- new_goal: user described a productivity goal with enough context to build a plan
 - needs_context: user wants something done but key info is missing — ask ONE question
 - confirmation: user is agreeing to proceed (yes, go ahead, sure, ok, etc.)
 - rejection: user is saying no, cancel, or stop
 - refinement: user wants to change or adjust the current goal or plan
 - create_event: user wants to add something to their calendar AND you have title + date + time
 - check_calendar: user wants to see what is on their calendar
-- question: user is asking a question
+- search_places: user wants to find a place (restaurant, cafe, gym, etc.)
+- select_place: user is picking one of the places shown in the previous assistant message (e.g. "the first one", "number 2", "add that to my calendar")
+- delete_event: user wants to remove an event from their calendar
+- ask_distances: user is asking how far the listed places are (e.g. "how far are they?", "what are the distances?", "which is closest?")
+- question: user is asking a general question
 - other: greetings, thanks, unrelated messages
 
 Rules:
 - Use needs_context if the user wants to create a calendar event but date or time is missing
 - Only use create_event when you have title, date, AND time
+- Use search_places when the user wants to find any kind of place or venue
+- Set nearby=true and populate location when the user says "near me" or gives a specific area
+- Set radius_meters based on what the user specifies (e.g. "2 km" → 2000, "500 m" → 500); default 2000
+- Use select_place when the user refers to a place from the previous list (e.g. "book the second one", "add it to my calendar")
+- selected_place_index is 0-based (first = 0, second = 1, etc.), null if not applicable
 - The calendar_event field is only required when intent is create_event, otherwise omit it or leave it empty
 - Convert relative dates to absolute dates (today is {today})
+- Always output times in LOCAL 24-hour format — do NOT convert to UTC (e.g. "5pm" → "17:00", "9am" → "09:00")
 - duration_minutes defaults to 60 if not specified
 
 Always accumulate context from the full conversation history.
@@ -56,6 +73,8 @@ Always accumulate context from the full conversation history.
 
 CONVERSATIONAL_SYSTEM_PROMPT = """
 You are a helpful personal assistant. You help users plan, organise, and manage their time.
+You are connected to the user's Google Calendar and Google Places.
+You can read events, create events, delete events, and search for places.
 
 Be warm, clear, and concise. Do not use filler phrases like "Certainly!" or "Of course!".
 Get straight to the point.
@@ -70,27 +89,17 @@ When asked a question, answer it directly.
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 class ConversationalOrchestrator:
-    """
-    Manages a multi-turn conversation with the user.
-
-    On each request:
-    1. Loads the session history
-    2. Adds the new user message
-    3. Detects intent
-    4. Routes to the right handler (pipeline, calendar, or conversation)
-    5. Saves the assistant reply back to history
-    6. Returns the response
-    """
-
     def __init__(self, store: AbstractSessionStore = None):
         self.store = store or default_store
         self.llm = LLMClient(model="claude-haiku-4-5-20251001")
         self.fast_llm = LLMClient(model="claude-haiku-4-5-20251001")
         self.pipeline = Orchestrator()
 
-        # Use the shared singleton — already authenticated at server startup
         from app.services.calendar_service import calendar_service
         self.calendar = calendar_service
+
+        from app.services.places_service import places_service
+        self.places = places_service
 
     def run(self, session_id: str, user_message: str) -> dict:
         history = self.store.get_history(session_id)
@@ -109,6 +118,9 @@ class ConversationalOrchestrator:
         goal = intent_data.get("goal", "").strip()
         context = intent_data.get("context", "").strip()
         calendar_event = intent_data.get("calendar_event", {})
+        delete_query = intent_data.get("delete_query", {})
+        places_query = intent_data.get("places_query", {})
+        selected_index = intent_data.get("selected_place_index")
 
         # ── Route ─────────────────────────────────────────────────────────────
         if intent in ("new_goal", "confirmation", "refinement") and goal:
@@ -117,8 +129,20 @@ class ConversationalOrchestrator:
         elif intent == "create_event" and calendar_event:
             response = self._handle_create_event(calendar_event)
 
+        elif intent == "delete_event":
+            response = self._handle_delete_event(delete_query)
+
         elif intent == "check_calendar":
             response = self._handle_check_calendar()
+
+        elif intent == "search_places" and places_query:
+            response = self._handle_search_places(places_query)
+
+        elif intent == "select_place":
+            response = self._handle_select_place(history, selected_index, calendar_event)
+
+        elif intent == "ask_distances":
+            response = self._handle_ask_distances()
 
         elif intent == "needs_context":
             response = self._handle_other(history)
@@ -144,16 +168,12 @@ class ConversationalOrchestrator:
         )
         result = parse_llm_json(raw)
         if "error" in result:
-            return {"intent": "other", "goal": "", "context": "", "calendar_event": {}}
+            return {"intent": "other", "goal": "", "context": "", "calendar_event": {}, "places_query": {}}
         return result
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
     def _handle_pipeline(self, goal: str, context: str) -> dict:
-        """
-        Runs Planner → Executor. Passes upcoming calendar events as context
-        so the planner can schedule around existing commitments.
-        """
         full_context = context
 
         if self.calendar:
@@ -163,7 +183,7 @@ class ConversationalOrchestrator:
                     calendar_context = self.calendar.format_events_for_context(events)
                     full_context = f"{context}\n\nUpcoming calendar events:\n{calendar_context}".strip()
             except Exception:
-                pass  # Calendar read failed — proceed without it
+                pass
 
         result = self.pipeline.run(goal=goal, context=full_context)
 
@@ -188,10 +208,6 @@ class ConversationalOrchestrator:
         }
 
     def _handle_create_event(self, calendar_event: dict) -> dict:
-        """
-        Creates a Google Calendar event.
-        Checks for conflicts first — if the slot is busy, tells the user instead of creating.
-        """
         if not self.calendar:
             return {
                 "assistant_message": "Calendar isn't connected yet. Set up credentials.json to enable this.",
@@ -203,6 +219,7 @@ class ConversationalOrchestrator:
         date = calendar_event.get("date", "")
         time = calendar_event.get("time", "")
         duration = calendar_event.get("duration_minutes", 60)
+        description = calendar_event.get("description", "")
 
         if not date or not time:
             return {
@@ -212,18 +229,24 @@ class ConversationalOrchestrator:
             }
 
         try:
-            # Check for conflicts before creating
             conflicts = self.calendar.check_conflicts(date, time, duration)
             if conflicts:
                 conflict_title = conflicts[0].get("summary", "something else")
+                # If the conflict is the same event title we're trying to create,
+                # it was already added — avoid an infinite loop.
+                if conflict_title.lower() == title.lower():
+                    return {
+                        "assistant_message": f"\"{title}\" is already on your calendar at {time} on {date}. Did you want to change the time or add something else?",
+                        "structured_data": None,
+                        "action": "conflict_detected"
+                    }
                 return {
                     "assistant_message": f"You already have \"{conflict_title}\" at that time. Want to pick a different slot?",
                     "structured_data": None,
                     "action": "conflict_detected"
                 }
 
-            # No conflicts — create the event
-            created = self.calendar.create_event(title, date, time, duration)
+            created = self.calendar.create_event(title, date, time, duration, description)
             confirmation = self.calendar.format_event_confirmation(created)
 
             return {
@@ -232,7 +255,7 @@ class ConversationalOrchestrator:
                 "action": "event_created"
             }
 
-        except Exception as e:
+        except Exception:
             return {
                 "assistant_message": "Something went wrong with the calendar. Try again?",
                 "structured_data": None,
@@ -240,9 +263,6 @@ class ConversationalOrchestrator:
             }
 
     def _handle_check_calendar(self) -> dict:
-        """
-        Fetches and displays upcoming events.
-        """
         if not self.calendar:
             return {
                 "assistant_message": "Calendar isn't connected yet. Set up credentials.json to enable this.",
@@ -272,6 +292,192 @@ class ConversationalOrchestrator:
                 "structured_data": None,
                 "action": "error"
             }
+
+    def _handle_search_places(self, places_query: dict) -> dict:
+        if not self.places:
+            return {
+                "assistant_message": "Places search isn't available. Check your GOOGLE_PLACES_API_KEY.",
+                "structured_data": None,
+                "action": "places_unavailable"
+            }
+
+        query = places_query.get("query", "")
+        location = places_query.get("location", "")
+        nearby = places_query.get("nearby", False)
+        radius = places_query.get("radius_meters", 2000)
+
+        if not query:
+            return {
+                "assistant_message": "What kind of place are you looking for?",
+                "structured_data": None,
+                "action": "needs_context"
+            }
+
+        try:
+            if nearby and location:
+                results = self.places.nearby_search(location=location, query=query, radius=radius)
+            else:
+                search_query = f"{query} {location}".strip()
+                results = self.places.text_search(query=search_query)
+
+            if not results:
+                return {
+                    "assistant_message": f"No results found for \"{query}\". Try a different search?",
+                    "structured_data": {"places": []},
+                    "action": "places_shown"
+                }
+
+            formatted = self.places.format_places_for_context(results)
+            self._last_places = results  # cache for select_place turn
+            return {
+                "assistant_message": f"Here's what I found:\n\n{formatted}\n\nWant to add one of these to your calendar?",
+                "structured_data": {"places": results},
+                "action": "places_shown"
+            }
+
+        except Exception as e:
+            return {
+                "assistant_message": "Couldn't complete the search right now. Try again?",
+                "structured_data": None,
+                "action": "error"
+            }
+
+    def _handle_select_place(
+        self,
+        history: ConversationHistory,
+        selected_index,
+        calendar_event: dict,
+    ) -> dict:
+        """
+        User picked a place from the previous list.
+        If we have date + time from the same message, create the event immediately.
+        Otherwise ask when they'd like to go.
+        """
+        # Pull stored places from the last places_shown action
+        places = self._get_last_places(history)
+
+        if not places:
+            return self._handle_other(history)
+
+        try:
+            index = int(selected_index) if selected_index is not None else 0
+        except (TypeError, ValueError):
+            index = 0
+
+        if index >= len(places):
+            index = 0
+
+        place = places[index]
+        name, description = self.places.format_place_for_event(place)
+
+        # If we already have date + time, create the event straight away
+        date = calendar_event.get("date", "") if calendar_event else ""
+        time = calendar_event.get("time", "") if calendar_event else ""
+        duration = calendar_event.get("duration_minutes", 60) if calendar_event else 60
+
+        if date and time:
+            event_data = {
+                "title": name,
+                "date": date,
+                "time": time,
+                "duration_minutes": duration,
+                "description": description,
+            }
+            return self._handle_create_event(event_data)
+
+        # No time yet — confirm the place and ask when
+        address = place.get("formatted_address") or place.get("vicinity", "")
+        address_str = f" ({address})" if address else ""
+        return {
+            "assistant_message": f"When would you like to go to {name}{address_str}?",
+            "structured_data": {"selected_place": place},
+            "action": "place_selected"
+        }
+
+    def _get_last_places(self, history: ConversationHistory) -> list:
+        """
+        Walks back through conversation messages to find the most recent
+        places list. We store them in structured_data but history only holds
+        text — so we re-parse from the assistant message if needed.
+        """
+        # The places are not stored in ConversationHistory (text only),
+        # so we re-run a minimal search using context from history.
+        # As a simpler approach: store places on the instance between turns.
+        return getattr(self, "_last_places", [])
+
+    def _handle_delete_event(self, delete_query: dict) -> dict:
+        if not self.calendar:
+            return {
+                "assistant_message": "Calendar isn't connected yet.",
+                "structured_data": None,
+                "action": "calendar_unavailable"
+            }
+
+        title_query = delete_query.get("title", "").lower().strip()
+        date_query = delete_query.get("date", "").strip()
+
+        if not title_query:
+            return {
+                "assistant_message": "Which event would you like to delete?",
+                "structured_data": None,
+                "action": "needs_context"
+            }
+
+        try:
+            events = self.calendar.get_upcoming_events(days=30)
+            words = [w for w in title_query.split() if len(w) > 2]
+            matches = [
+                e for e in events
+                if all(w in e.get("summary", "").lower() for w in words)
+                and (not date_query or date_query in e.get("start", {}).get("dateTime", ""))
+            ]
+
+            if not matches:
+                return {
+                    "assistant_message": f"I couldn't find any upcoming event matching \"{delete_query.get('title')}\". Want me to show your calendar?",
+                    "structured_data": None,
+                    "action": "not_found"
+                }
+
+            if len(matches) == 1:
+                event = matches[0]
+                self.calendar.delete_event(event["id"])
+                confirmation = self.calendar.format_event_confirmation(event)
+                return {
+                    "assistant_message": f"Done — removed {confirmation} from your calendar.",
+                    "structured_data": {"deleted_event": event},
+                    "action": "event_deleted"
+                }
+
+            # Multiple matches — list them and ask which one
+            formatted = self.calendar.format_events_for_context(matches)
+            return {
+                "assistant_message": f"I found a few matching events:\n\n{formatted}\n\nWhich one would you like to delete?",
+                "structured_data": {"matches": matches},
+                "action": "needs_context"
+            }
+
+        except Exception:
+            return {
+                "assistant_message": "Something went wrong with the calendar. Try again?",
+                "structured_data": None,
+                "action": "error"
+            }
+
+    def _handle_ask_distances(self) -> dict:
+        places = getattr(self, "_last_places", [])
+        if not places:
+            return {
+                "assistant_message": "I don't have a list of places to show distances for. Try searching first.",
+                "structured_data": None,
+                "action": "conversation"
+            }
+        formatted = self.places.format_places_for_context(places, include_distances=True)
+        return {
+            "assistant_message": f"Here are the straight-line distances from your search location:\n\n{formatted}",
+            "structured_data": {"places": places},
+            "action": "distances_shown"
+        }
 
     def _handle_rejection(self, history: ConversationHistory) -> dict:
         raw = self.llm.chat_with_history(
