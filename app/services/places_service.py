@@ -114,15 +114,19 @@ class PlacesService:
     def format_place_for_event(self, place: dict) -> tuple[str, str]:
         """
         Returns (event_title, event_description) for creating a calendar event
-        at this place.
+        at this place. Includes website/booking link if present.
         """
         name = place.get("name", "Visit")
-        address = (
-            place.get("formatted_address")
-            or place.get("vicinity", "")
-        )
-        description = f"Location: {address}" if address else ""
-        return name, description
+        address = place.get("formatted_address") or place.get("vicinity", "")
+        website = place.get("website", "")
+
+        parts = []
+        if address:
+            parts.append(f"Location: {address}")
+        if website:
+            parts.append(f"Book/info: {website}")
+
+        return name, "\n".join(parts)
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ Read the conversation history and classify the user's latest message.
 
 Respond with ONLY a valid JSON object — no extra text:
 {{
-    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "question" | "other",
+    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "check_weather" | "question" | "other",
     "goal": "the user's productivity goal if one exists, otherwise empty string",
     "context": "any useful context from the full conversation (preferences, constraints, answers), otherwise empty string",
     "calendar_event": {{
@@ -29,6 +29,10 @@ Respond with ONLY a valid JSON object — no extra text:
     "delete_query": {{
         "title": "partial or full title of the event to delete",
         "date": "YYYY-MM-DD or empty string if not specified"
+    }},
+    "weather_query": {{
+        "location": "city or area to check weather for",
+        "date": "YYYY-MM-DD for a specific day, or empty string for full forecast"
     }},
     "places_query": {{
         "query": "what the user is looking for (e.g. Italian restaurant)",
@@ -50,6 +54,7 @@ Intent definitions:
 - search_places: user wants to find a place (restaurant, cafe, gym, etc.)
 - select_place: user is picking one of the places shown in the previous assistant message (e.g. "the first one", "number 2", "add that to my calendar")
 - delete_event: user wants to remove an event from their calendar
+- check_weather: user wants to know the weather for a location or date
 - ask_distances: user is asking how far the listed places are (e.g. "how far are they?", "what are the distances?", "which is closest?")
 - question: user is asking a general question
 - other: greetings, thanks, unrelated messages
@@ -101,6 +106,9 @@ class ConversationalOrchestrator:
         from app.services.places_service import places_service
         self.places = places_service
 
+        from app.services.weather_service import weather_service
+        self.weather = weather_service
+
     def run(self, session_id: str, user_message: str) -> dict:
         history = self.store.get_history(session_id)
         if history is None:
@@ -119,6 +127,7 @@ class ConversationalOrchestrator:
         context = intent_data.get("context", "").strip()
         calendar_event = intent_data.get("calendar_event", {})
         delete_query = intent_data.get("delete_query", {})
+        weather_query = intent_data.get("weather_query", {})
         places_query = intent_data.get("places_query", {})
         selected_index = intent_data.get("selected_place_index")
 
@@ -143,6 +152,9 @@ class ConversationalOrchestrator:
 
         elif intent == "ask_distances":
             response = self._handle_ask_distances()
+
+        elif intent == "check_weather":
+            response = self._handle_check_weather(weather_query)
 
         elif intent == "needs_context":
             response = self._handle_other(history)
@@ -182,6 +194,15 @@ class ConversationalOrchestrator:
                 if events:
                     calendar_context = self.calendar.format_events_for_context(events)
                     full_context = f"{context}\n\nUpcoming calendar events:\n{calendar_context}".strip()
+            except Exception:
+                pass
+
+        if self.weather:
+            try:
+                forecast = self.weather.get_forecast("Tel Aviv", days=3)
+                if forecast:
+                    weather_context = self.weather.format_forecast(forecast)
+                    full_context = f"{full_context}\n\nWeather forecast (Tel Aviv):\n{weather_context}".strip()
             except Exception:
                 pass
 
@@ -368,7 +389,18 @@ class ConversationalOrchestrator:
             index = 0
 
         place = places[index]
+
+        # Enrich with details (website, phone) if we have a place_id
+        place_id = place.get("place_id")
+        if place_id:
+            try:
+                details = self.places.get_place_details(place_id)
+                place = {**place, **details}  # merge, details take precedence
+            except Exception:
+                pass
+
         name, description = self.places.format_place_for_event(place)
+        website = place.get("website", "")
 
         # If we already have date + time, create the event straight away
         date = calendar_event.get("date", "") if calendar_event else ""
@@ -383,13 +415,17 @@ class ConversationalOrchestrator:
                 "duration_minutes": duration,
                 "description": description,
             }
-            return self._handle_create_event(event_data)
+            response = self._handle_create_event(event_data)
+            if website and response.get("action") == "event_created":
+                response["assistant_message"] += f"\n\nBooking / more info: {website}"
+            return response
 
-        # No time yet — confirm the place and ask when
+        # No time yet — confirm the place, show booking link, and ask when
         address = place.get("formatted_address") or place.get("vicinity", "")
         address_str = f" ({address})" if address else ""
+        website_str = f"\n\nBooking / more info: {website}" if website else ""
         return {
-            "assistant_message": f"When would you like to go to {name}{address_str}?",
+            "assistant_message": f"When would you like to go to {name}{address_str}?{website_str}",
             "structured_data": {"selected_place": place},
             "action": "place_selected"
         }
@@ -460,6 +496,62 @@ class ConversationalOrchestrator:
         except Exception:
             return {
                 "assistant_message": "Something went wrong with the calendar. Try again?",
+                "structured_data": None,
+                "action": "error"
+            }
+
+    def _handle_check_weather(self, weather_query: dict) -> dict:
+        if not self.weather:
+            return {
+                "assistant_message": "Weather service isn't available right now.",
+                "structured_data": None,
+                "action": "error"
+            }
+
+        location = weather_query.get("location", "").strip()
+        target_date = weather_query.get("date", "").strip()
+
+        if not location:
+            return {
+                "assistant_message": "Which city or area would you like the weather for?",
+                "structured_data": None,
+                "action": "needs_context"
+            }
+
+        try:
+            if target_date:
+                day = self.weather.get_weather_for_date(location, target_date)
+                if not day:
+                    return {
+                        "assistant_message": f"I can only forecast up to 16 days ahead. {target_date} is out of range.",
+                        "structured_data": None,
+                        "action": "weather_shown"
+                    }
+                formatted = self.weather.format_single_day(day)
+                warning = " You might want to plan for that." if self.weather.is_bad_weather(day) else ""
+                return {
+                    "assistant_message": f"Weather in {location} on that day:\n{formatted}{warning}",
+                    "structured_data": {"weather": day},
+                    "action": "weather_shown"
+                }
+            else:
+                forecast = self.weather.get_forecast(location, days=7)
+                formatted = self.weather.format_forecast(forecast)
+                return {
+                    "assistant_message": f"3-day forecast for {location}:\n\n{formatted}",
+                    "structured_data": {"forecast": forecast},
+                    "action": "weather_shown"
+                }
+
+        except ValueError as e:
+            return {
+                "assistant_message": f"Couldn't find weather for \"{location}\". Try a city name.",
+                "structured_data": None,
+                "action": "error"
+            }
+        except Exception:
+            return {
+                "assistant_message": "Couldn't fetch the weather right now. Try again?",
                 "structured_data": None,
                 "action": "error"
             }
