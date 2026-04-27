@@ -208,12 +208,27 @@
 
 <script>
   let sessionId = null;
+  let userLocation = null;  // { lat, lng } once granted
 
   const messagesEl  = document.getElementById("messages");
   const input       = document.getElementById("msg-input");
   const sendBtn     = document.getElementById("send-btn");
   const statusEl    = document.getElementById("status");
   const sessionLabel = document.getElementById("session-label");
+
+  // ── Request geolocation ─────────────────────────────────────────────────────
+  function requestLocation() {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        statusEl.textContent = "Connected · Location enabled";
+      },
+      () => {
+        // Permission denied or unavailable — silently continue without it
+      }
+    );
+  }
 
   // ── Start session on page load ──────────────────────────────────────────────
   async function startSession() {
@@ -255,10 +270,13 @@
     const typingId = addTyping();
 
     try {
+      const body = { session_id: sessionId, message: text };
+      if (userLocation) body.location = userLocation;
+
       const res = await fetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, message: text })
+        body: JSON.stringify(body)
       });
 
       removeTyping(typingId);
@@ -362,6 +380,7 @@
   document.getElementById("new-chat-btn").addEventListener("click", resetChat);
 
   // ── Boot ─────────────────────────────────────────────────────────────────────
+  requestLocation();
   startSession();
 </script>
 </body>

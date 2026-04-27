@@ -28,9 +28,15 @@ class NewSessionResponse(BaseModel):
     message: str
 
 
+class UserLocation(BaseModel):
+    lat: float
+    lng: float
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    location: Optional[UserLocation] = None
 
 
 class ChatResponse(BaseModel):
@@ -72,9 +78,11 @@ def chat(request: ChatRequest):
 
     try:
         orchestrator = ConversationalOrchestrator()
+        location = {"lat": request.location.lat, "lng": request.location.lng} if request.location else None
         result = orchestrator.run(
             session_id=request.session_id,
-            user_message=request.message
+            user_message=request.message,
+            location=location,
         )
         return ChatResponse(**result)
     except ValueError as e:

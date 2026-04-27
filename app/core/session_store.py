@@ -1,5 +1,6 @@
 import uuid
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from app.core.conversation import ConversationHistory
 
 
@@ -62,8 +63,76 @@ class InMemorySessionStore(AbstractSessionStore):
         return session_id in self._store
 
 
-# This is the single shared store used across the whole app.
-# Every request reads and writes to this same object.
-# To switch to PostgreSQL later: replace InMemorySessionStore()
-# with PostgresSessionStore() — one line change.
-session_store = InMemorySessionStore()
+class SQLiteSessionStore(AbstractSessionStore):
+    """
+    Persists sessions and conversation history in a SQLite database
+    (or any SQLAlchemy-supported database via DATABASE_URL in .env).
+
+    Schema:
+      sessions  — one row per session (session_id, created_at, updated_at)
+      messages  — one row per message (session_id, role, content, created_at)
+    """
+
+    def __init__(self):
+        from app.core.database import create_tables, SessionLocal, SessionModel, MessageModel
+        create_tables()
+        self._SessionLocal = SessionLocal
+        self._SessionModel = SessionModel
+        self._MessageModel = MessageModel
+
+    # ── Interface ─────────────────────────────────────────────────────────────
+
+    def create_session(self) -> str:
+        session_id = str(uuid.uuid4())
+        with self._SessionLocal() as db:
+            db.add(self._SessionModel(session_id=session_id))
+            db.commit()
+        return session_id
+
+    def get_history(self, session_id: str):
+        with self._SessionLocal() as db:
+            session = db.get(self._SessionModel, session_id)
+            if session is None:
+                return None
+
+            rows = (
+                db.query(self._MessageModel)
+                .filter_by(session_id=session_id)
+                .order_by(self._MessageModel.id)
+                .all()
+            )
+
+        history = ConversationHistory()
+        for row in rows:
+            if row.role == "user":
+                history.add_user(row.content)
+            elif row.role == "assistant":
+                history.add_assistant(row.content)
+        return history
+
+    def save_history(self, session_id: str, history: ConversationHistory) -> None:
+        with self._SessionLocal() as db:
+            # Delete existing messages and rewrite — simple and correct
+            db.query(self._MessageModel).filter_by(session_id=session_id).delete()
+            for msg in history.get_messages():
+                db.add(self._MessageModel(
+                    session_id=session_id,
+                    role=msg["role"],
+                    content=msg["content"] if isinstance(msg["content"], str)
+                            else str(msg["content"]),
+                ))
+            # Touch updated_at
+            session = db.get(self._SessionModel, session_id)
+            if session:
+                session.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
+    def session_exists(self, session_id: str) -> bool:
+        with self._SessionLocal() as db:
+            return db.get(self._SessionModel, session_id) is not None
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+# SQLiteSessionStore persists across server restarts.
+# To use PostgreSQL: set DATABASE_URL=postgresql://... in .env
+session_store = SQLiteSessionStore()

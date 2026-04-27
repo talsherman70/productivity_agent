@@ -109,7 +109,10 @@ class ConversationalOrchestrator:
         from app.services.weather_service import weather_service
         self.weather = weather_service
 
-    def run(self, session_id: str, user_message: str) -> dict:
+        from app.services.jewish_calendar_service import jewish_calendar_service
+        self.jewish_calendar = jewish_calendar_service
+
+    def run(self, session_id: str, user_message: str, location: dict = None) -> dict:
         history = self.store.get_history(session_id)
         if history is None:
             return {
@@ -120,6 +123,10 @@ class ConversationalOrchestrator:
             }
 
         history.add_user(user_message)
+
+        # Store latest location on the instance for use by handlers
+        if location:
+            self._user_location = location
 
         intent_data = self._detect_intent(history)
         intent = intent_data.get("intent", "other")
@@ -199,10 +206,23 @@ class ConversationalOrchestrator:
 
         if self.weather:
             try:
-                forecast = self.weather.get_forecast("Tel Aviv", days=3)
+                loc = getattr(self, "_user_location", None)
+                weather_location = f"{loc['lat']},{loc['lng']}" if loc else "Tel Aviv"
+                forecast = self.weather.get_forecast(weather_location, days=3)
                 if forecast:
                     weather_context = self.weather.format_forecast(forecast)
-                    full_context = f"{full_context}\n\nWeather forecast (Tel Aviv):\n{weather_context}".strip()
+                    full_context = f"{full_context}\n\nWeather forecast (next 3 days):\n{weather_context}".strip()
+            except Exception:
+                pass
+
+        if self.jewish_calendar:
+            try:
+                from datetime import date, timedelta
+                today = date.today().isoformat()
+                two_weeks = (date.today() + timedelta(days=14)).isoformat()
+                jewish_context = self.jewish_calendar.format_for_planner(today, two_weeks)
+                if jewish_context:
+                    full_context = f"{full_context}\n\nJewish calendar constraints (next 14 days):\n{jewish_context}".strip()
             except Exception:
                 pass
 
@@ -512,11 +532,15 @@ class ConversationalOrchestrator:
         target_date = weather_query.get("date", "").strip()
 
         if not location:
-            return {
-                "assistant_message": "Which city or area would you like the weather for?",
-                "structured_data": None,
-                "action": "needs_context"
-            }
+            user_loc = getattr(self, "_user_location", None)
+            if user_loc:
+                location = f"{user_loc['lat']},{user_loc['lng']}"
+            else:
+                return {
+                    "assistant_message": "Which city or area would you like the weather for?",
+                    "structured_data": None,
+                    "action": "needs_context"
+                }
 
         try:
             if target_date:
@@ -530,7 +554,7 @@ class ConversationalOrchestrator:
                 formatted = self.weather.format_single_day(day)
                 warning = " You might want to plan for that." if self.weather.is_bad_weather(day) else ""
                 return {
-                    "assistant_message": f"Weather in {location} on that day:\n{formatted}{warning}",
+                    "assistant_message": f"Weather on that day:\n{formatted}{warning}",
                     "structured_data": {"weather": day},
                     "action": "weather_shown"
                 }
@@ -538,7 +562,7 @@ class ConversationalOrchestrator:
                 forecast = self.weather.get_forecast(location, days=7)
                 formatted = self.weather.format_forecast(forecast)
                 return {
-                    "assistant_message": f"3-day forecast for {location}:\n\n{formatted}",
+                    "assistant_message": f"Weather for the next 3 days:\n\n{formatted}",
                     "structured_data": {"forecast": forecast},
                     "action": "weather_shown"
                 }

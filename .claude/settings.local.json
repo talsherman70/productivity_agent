@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/Scripts/python -c \":*)"
+      "Bash(.venv/Scripts/python -c \":*)",
+      "Bash(.venv/Scripts/pytest tests/test_jewish_calendar_service.py tests/test_weather_service.py -v)",
+      "Bash(.venv/Scripts/pytest --tb=short -q)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/pytest tests/test_sqlite_session_store.py -v)",
+      "Bash(.venv/Scripts/pytest tests/test_calendar_integration.py -v --tb=short)",
+      "Bash(.venv/Scripts/python setup_calendar.py)"
     ]
   }
 }
