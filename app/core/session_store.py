@@ -74,11 +74,12 @@ class SQLiteSessionStore(AbstractSessionStore):
     """
 
     def __init__(self):
-        from app.core.database import create_tables, SessionLocal, SessionModel, MessageModel
+        from app.core.database import create_tables, SessionLocal, SessionModel, MessageModel, PhoneSessionModel
         create_tables()
         self._SessionLocal = SessionLocal
         self._SessionModel = SessionModel
         self._MessageModel = MessageModel
+        self._PhoneSessionModel = PhoneSessionModel
 
     # ── Interface ─────────────────────────────────────────────────────────────
 
@@ -130,6 +131,22 @@ class SQLiteSessionStore(AbstractSessionStore):
     def session_exists(self, session_id: str) -> bool:
         with self._SessionLocal() as db:
             return db.get(self._SessionModel, session_id) is not None
+
+    def get_or_create_by_phone(self, phone: str) -> str:
+        """
+        Returns the session_id for a WhatsApp phone number.
+        Creates a new session if this phone number hasn't been seen before.
+        """
+        with self._SessionLocal() as db:
+            mapping = db.get(self._PhoneSessionModel, phone)
+            if mapping:
+                return mapping.session_id
+
+            session_id = str(uuid.uuid4())
+            db.add(self._SessionModel(session_id=session_id))
+            db.add(self._PhoneSessionModel(phone=phone, session_id=session_id))
+            db.commit()
+            return session_id
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

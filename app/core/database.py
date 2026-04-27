@@ -44,6 +44,15 @@ class MessageModel(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class PhoneSessionModel(Base):
+    """Maps a WhatsApp phone number to a persistent session_id."""
+    __tablename__ = "phone_sessions"
+
+    phone      = Column(String, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("sessions.session_id"), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 def create_tables():
     """Creates all tables if they don't already exist."""
     # Ensure the data directory exists for SQLite

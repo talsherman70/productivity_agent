@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from app.api.routes import router
+from app.api.whatsapp import router as whatsapp_router
 import os
 
 app = FastAPI(
@@ -15,6 +16,7 @@ static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 app.include_router(router)
+app.include_router(whatsapp_router)
 
 
 @app.get("/")
