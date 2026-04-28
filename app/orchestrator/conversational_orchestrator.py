@@ -17,7 +17,7 @@ Read the conversation history and classify the user's latest message.
 
 Respond with ONLY a valid JSON object — no extra text:
 {{
-    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "replace_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "check_weather" | "question" | "other",
+    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "replace_event" | "delete_event" | "delete_range" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "check_weather" | "question" | "other",
     "goal": "the user's productivity goal if one exists, otherwise empty string",
     "context": "any useful context from the full conversation (preferences, constraints, answers), otherwise empty string",
     "calendar_event": {{
@@ -40,6 +40,13 @@ Respond with ONLY a valid JSON object — no extra text:
         "nearby": false,
         "radius_meters": 2000
     }},
+    "delete_range_query": {{
+        "date_from": "YYYY-MM-DD",
+        "date_to": "YYYY-MM-DD",
+        "time_from": "HH:MM or empty string if not specified",
+        "time_to": "HH:MM or empty string if not specified",
+        "title_filter": "keyword to match event titles (e.g. 'yoga'), empty string to match all"
+    }},
     "selected_place_index": null
 }}
 
@@ -54,7 +61,8 @@ Intent definitions:
 - check_calendar: user wants to see what is on their calendar
 - search_places: user wants to find a place (restaurant, cafe, gym, etc.)
 - select_place: user is picking one of the places shown in the previous assistant message
-- delete_event: user wants to remove an event from their calendar
+- delete_event: user wants to remove a specific named event from their calendar
+- delete_range: user wants to remove ALL events within a date range or time window (e.g. "delete everything from May 1 to May 5", "clear my calendar from 9am to 2pm")
 - check_weather: user wants to know the weather for a location or date
 - ask_distances: user is asking how far the listed places are
 - question: user is asking a general question
@@ -71,6 +79,7 @@ Rules:
 - selected_place_index is 0-based (first = 0, second = 1, etc.), null if not applicable
 - The calendar_event field is only required when intent is create_event or replace_event
 - Convert relative dates to absolute dates (today is {today})
+- For delete_range: populate delete_range_query with date_from/date_to; add time_from/time_to if a time window was specified; if only one date mentioned use it for both date_from and date_to
 
 TIME RULES — output the local time the user stated, converted to 24-hour. No UTC conversion. The system handles timezone internally.
 - "6am" → "06:00", "9am" → "09:00", "11am" → "11:00"
@@ -85,6 +94,8 @@ Always accumulate context from the full conversation history.
 CONVERSATIONAL_SYSTEM_PROMPT = """
 You are a helpful personal assistant. You help users plan, organise, and manage their time.
 
+You have full access to the current conversation history — you CAN see and reference everything said earlier in this session. Never claim you don't have memory of the conversation.
+
 IMPORTANT — what you can and cannot do in this context:
 - You CANNOT execute calendar or places operations yourself. The system handles those automatically.
 - NEVER say "I've added X to your calendar", "I've deleted X", "Done!", or similar — only the system can confirm completed actions. If you say it, you are lying.
@@ -93,6 +104,7 @@ IMPORTANT — what you can and cannot do in this context:
 - If you truly cannot route the request, say: "Could you rephrase that? For example: 'add [title] on [date] at [time]' or 'delete my [event name]'."
 
 What you CAN do here:
+- Reference earlier messages in this conversation
 - Ask ONE clarifying question to collect missing information
 - Answer general questions
 - Acknowledge rejections and ask what the user wants instead
@@ -121,6 +133,7 @@ class ConversationalOrchestrator:
 
         from app.services.jewish_calendar_service import jewish_calendar_service
         self.jewish_calendar = jewish_calendar_service
+        self._pending_delete = []  # events awaiting confirmation before deletion
 
     def run(self, session_id: str, user_message: str, location: dict = None) -> dict:
         try:
@@ -155,6 +168,7 @@ class ConversationalOrchestrator:
         context = intent_data.get("context", "").strip()
         calendar_event = intent_data.get("calendar_event", {})
         delete_query = intent_data.get("delete_query", {})
+        delete_range_query = intent_data.get("delete_range_query", {})
         weather_query = intent_data.get("weather_query", {})
         places_query = intent_data.get("places_query", {})
         selected_index = intent_data.get("selected_place_index")
@@ -175,6 +189,9 @@ class ConversationalOrchestrator:
         elif intent == "replace_event":
             response = self._handle_replace_event(delete_query, calendar_event)
 
+        elif intent == "delete_range":
+            response = self._handle_delete_range(delete_range_query)
+
         elif intent == "delete_event":
             if delete_query.get("title") or delete_query.get("date"):
                 response = self._handle_delete_event(delete_query)
@@ -184,6 +201,17 @@ class ConversationalOrchestrator:
                     "structured_data": None,
                     "action": "needs_context",
                 }
+
+        elif intent == "confirmation" and self._pending_delete:
+            response = self._confirm_pending_delete()
+
+        elif intent == "rejection" and self._pending_delete:
+            self._pending_delete = []
+            response = {
+                "assistant_message": "No problem — nothing was deleted.",
+                "structured_data": None,
+                "action": "cancelled",
+            }
 
         elif intent in ("new_goal", "confirmation", "refinement") and goal:
             response = self._handle_pipeline(goal, context)
@@ -538,24 +566,117 @@ class ConversationalOrchestrator:
                     "action": "not_found"
                 }
 
-            if len(matches) == 1:
-                event = matches[0]
-                self.calendar.delete_event(event["id"])
-                confirmation = self.calendar.format_event_confirmation(event)
+            if len(matches) > 1:
+                formatted = self.calendar.format_events_for_context(matches)
                 return {
-                    "assistant_message": f"Done — removed {confirmation} from your calendar.",
-                    "structured_data": {"deleted_event": event},
-                    "action": "event_deleted"
+                    "assistant_message": f"I found a few matching events:\n\n{formatted}\n\nWhich one would you like to delete?",
+                    "structured_data": {"matches": matches},
+                    "action": "needs_context"
                 }
 
-            # Multiple matches — list them and ask which one
-            formatted = self.calendar.format_events_for_context(matches)
+            # Exactly one match — preview and ask for confirmation
+            event = matches[0]
+            confirmation = self.calendar.format_event_confirmation(event)
+            self._pending_delete = [event]
             return {
-                "assistant_message": f"I found a few matching events:\n\n{formatted}\n\nWhich one would you like to delete?",
-                "structured_data": {"matches": matches},
+                "assistant_message": f"I found **{confirmation}**. Should I delete it?",
+                "structured_data": {"pending": matches},
+                "action": "delete_preview"
+            }
+
+        except Exception:
+            return {
+                "assistant_message": "Something went wrong while searching. Try again?",
+                "structured_data": None,
+                "action": "error"
+            }
+
+    def _handle_delete_range(self, query: dict) -> dict:
+        if not self.calendar:
+            return {
+                "assistant_message": "Calendar isn't connected yet.",
+                "structured_data": None,
+                "action": "calendar_unavailable"
+            }
+
+        date_from = query.get("date_from", "").strip()
+        date_to = query.get("date_to", "").strip()
+        time_from = query.get("time_from", "").strip()
+        time_to = query.get("time_to", "").strip()
+        title_filter = query.get("title_filter", "").lower().strip()
+
+        if not date_from or not date_to:
+            return {
+                "assistant_message": "I need a date range. For example: 'delete everything from May 1 to May 5'.",
+                "structured_data": None,
                 "action": "needs_context"
             }
 
+        try:
+            range_start = self.calendar._make_aware(date_from, time_from or "00:00")
+            range_end   = self.calendar._make_aware(date_to,   time_to   or "23:59")
+            events = self.calendar.get_events_in_range(range_start, range_end)
+
+            # Filter by title keyword if provided
+            if title_filter:
+                words = [w for w in title_filter.split() if len(w) >= 2]
+                events = [
+                    e for e in events
+                    if all(w in e.get("summary", "").lower() for w in words)
+                ]
+
+            # Filter by time window if provided
+            if time_from and time_to:
+                def in_window(event):
+                    dt_str = event.get("start", {}).get("dateTime", "")
+                    if not dt_str:
+                        return False
+                    dt = self.calendar._parse_google_dt(dt_str)
+                    local = dt.astimezone(self.calendar.tz) - timedelta(hours=3)
+                    t = local.strftime("%H:%M")
+                    return time_from <= t <= time_to
+                events = [e for e in events if in_window(e)]
+
+            if not events:
+                return {
+                    "assistant_message": "No matching events found in that range.",
+                    "structured_data": {"pending": []},
+                    "action": "delete_preview"
+                }
+
+            # Preview and ask for confirmation
+            formatted = self.calendar.format_events_for_context(events)
+            count = len(events)
+            self._pending_delete = events
+            return {
+                "assistant_message": f"I found {count} event{'s' if count != 1 else ''} to delete:\n\n{formatted}\n\nShould I remove all of them?",
+                "structured_data": {"pending": events},
+                "action": "delete_preview"
+            }
+
+        except Exception:
+            return {
+                "assistant_message": "Something went wrong while searching. Try again?",
+                "structured_data": None,
+                "action": "error"
+            }
+
+    def _confirm_pending_delete(self) -> dict:
+        events = self._pending_delete
+        self._pending_delete = []
+        try:
+            for event in events:
+                self.calendar.delete_event(event["id"])
+            count = len(events)
+            titles = [e.get("summary", "Untitled") for e in events]
+            summary = ", ".join(f'"{t}"' for t in titles[:5])
+            if count > 5:
+                summary += f" and {count - 5} more"
+            return {
+                "assistant_message": f"Done — removed {count} event{'s' if count != 1 else ''}: {summary}.",
+                "structured_data": {"deleted": events},
+                "action": "delete_range_done"
+            }
         except Exception:
             return {
                 "assistant_message": "Something went wrong while deleting. Try again?",

@@ -121,6 +121,16 @@ class CalendarService:
             calendarId="primary", body=event_body
         ).execute()
 
+    def get_events_in_range(self, start_dt: datetime, end_dt: datetime) -> list:
+        result = self.service.events().list(
+            calendarId="primary",
+            timeMin=start_dt.isoformat(),
+            timeMax=end_dt.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+        return result.get("items", [])
+
     def delete_event(self, event_id: str) -> None:
         """Deletes an event by its Google Calendar event ID."""
         self.service.events().delete(

@@ -1,44 +1,65 @@
 # Productivity Agent
 
-A multi-agent AI assistant that takes a user's productivity goal and returns a structured, reviewed, and scored action plan.
+A multi-agent AI assistant for personal productivity — plan goals, manage your Google Calendar, find places, check the weather, and chat via WhatsApp.
 
-Built as a portfolio project using Python, FastAPI, and the Claude API (Anthropic).
+Built with Python, FastAPI, and the Claude API (Anthropic).
 
 ---
 
 ## What it does
 
-You send a goal like _"Prepare for a Python job interview next week"_ and the system:
+You send a message like _"Prepare for a Python job interview next week"_ and the assistant:
 
 1. **Plans** — breaks the goal into a concrete task list with priorities and time estimates
 2. **Executes** — runs analytical tools (conflict detection, prioritization, validation) and interprets the results
-3. **Critiques** — scores the plan out of 10, lists strengths and issues, and gives a one-sentence final verdict
+3. **Acts** — creates, deletes, or checks calendar events; searches for places; fetches weather; answers questions
 
-All three steps are chained automatically by an Orchestrator.
+The assistant is conversational and multi-turn — it maintains session history, asks clarifying questions when information is missing, and confirms before taking destructive actions like deleting events.
 
 ---
 
 ## Architecture
 
+### Conversation flow
+
 ```
-POST /run
+POST /chat
     │
     ▼
+ConversationalOrchestrator
+    │
+    ├── Intent detection (Claude Sonnet) ──────────────────────────────────────────────┐
+    │       Classifies message as one of:                                               │
+    │       new_goal / create_event / delete_event / delete_range / replace_event /     │
+    │       check_calendar / search_places / check_weather / confirmation / ...          │
+    │                                                                                   │
+    ├── Calendar handler ── Google Calendar API (create / delete / list / range-delete) │
+    ├── Places handler ───── Google Places API (text search, nearby search, details)    │
+    ├── Weather handler ──── wttr.in (free forecast API, no key needed)                │
+    ├── Planning pipeline ── Planner → Executor (see below)                             │
+    └── Conversational LLM ─ Claude Haiku (clarifying questions, general answers)      │
+                                                                                        │
+    Context injected into every planning request: ──────────────────────────────────────┘
+        - Upcoming Google Calendar events
+        - 3-day weather forecast
+        - Jewish holidays & Shabbat times (Hebcal API)
+```
+
+### Planning pipeline (used for goal-based requests)
+
+```
 Orchestrator (coordinator.py)
     │
-    ├── PlannerAgent     → asks Claude to break the goal into tasks (JSON)
+    ├── PlannerAgent     → breaks goal into tasks (JSON)
     │
-    ├── ExecutorAgent    → runs 4 tools on the plan, asks Claude to interpret results
+    ├── ExecutorAgent    → runs tools, asks Claude to interpret
     │       ├── validate_plan
     │       ├── detect_schedule_conflicts
     │       ├── prioritize_tasks
     │       └── summarize_plan
     │
-    └── CriticAgent      → asks Claude to score and review the full pipeline output
+    └── CriticAgent      → scores and reviews the plan (currently unused in chat flow)
 ```
-
-Each agent talks to Claude via `LLMClient`, a thin wrapper around the Anthropic SDK.
-All agents share `parse_llm_json()` from `app/core/utils.py` to safely parse Claude's JSON responses.
 
 ---
 
@@ -47,23 +68,40 @@ All agents share `parse_llm_json()` from `app/core/utils.py` to safely parse Cla
 ```
 productivity_agent/
 ├── app/
-│   ├── main.py                     # FastAPI app entry point
+│   ├── main.py                              # FastAPI app entry point
+│   ├── static/
+│   │   └── index.html                       # Web chat UI
 │   ├── api/
-│   │   └── routes.py               # /run and /health endpoints
+│   │   ├── routes.py                        # /chat/new, /chat, /run, /health
+│   │   └── whatsapp.py                      # Twilio WhatsApp webhook
 │   ├── agents/
-│   │   ├── planner.py              # PlannerAgent
-│   │   ├── executor.py             # ExecutorAgent
-│   │   └── critic.py               # CriticAgent
+│   │   ├── planner.py                       # PlannerAgent — goal → task list
+│   │   ├── executor.py                      # ExecutorAgent — tools + interpretation
+│   │   └── critic.py                        # CriticAgent — scores plan 1–10
 │   ├── tools/
-│   │   └── productivity.py         # validate_plan, detect_schedule_conflicts, etc.
+│   │   └── productivity.py                  # validate_plan, detect_conflicts, prioritize, summarize
 │   ├── orchestrator/
-│   │   └── coordinator.py          # Chains all agents in sequence
-│   └── core/
-│       ├── llm_client.py           # Anthropic API wrapper
-│       └── utils.py                # Shared JSON parser
+│   │   ├── coordinator.py                   # Chains Planner → Executor
+│   │   └── conversational_orchestrator.py   # Multi-turn intent router (main entry point)
+│   ├── core/
+│   │   ├── llm_client.py                    # Anthropic SDK wrapper
+│   │   ├── utils.py                         # parse_llm_json()
+│   │   ├── conversation.py                  # ConversationHistory (per session)
+│   │   ├── database.py                      # SQLAlchemy models (sessions, messages, phone mappings)
+│   │   └── session_store.py                 # InMemory + SQLite session stores
+│   └── services/
+│       ├── calendar_service.py              # Google Calendar read/write
+│       ├── weather_service.py               # wttr.in weather forecast
+│       ├── places_service.py                # Google Places search
+│       └── jewish_calendar_service.py       # Hebcal holidays & Shabbat times
+├── tests/                                   # pytest suite (14 files)
+├── data/
+│   └── sessions.db                          # SQLite session store (auto-created)
+├── setup_calendar.py                        # One-time Google OAuth flow
 ├── requirements.txt
-├── .env                            # Your API key goes here (never commit this)
-└── README.md
+├── .env                                     # API keys (never commit)
+├── credentials.json                         # Google OAuth2 credentials (never commit)
+└── token.json                               # Google auth token (auto-generated, never commit)
 ```
 
 ---
@@ -75,111 +113,142 @@ productivity_agent/
 | Python 3.11+ | Core language |
 | FastAPI | REST API framework |
 | Uvicorn | ASGI server |
-| Anthropic SDK | Claude API client |
+| Anthropic SDK | Claude API (Sonnet for intent, Haiku for conversation) |
+| Google Calendar API | Create, read, delete events |
+| Google Places API | Place search and details |
+| wttr.in | Free weather forecast (no key needed) |
+| Hebcal API | Jewish holidays and Shabbat times (no key needed) |
+| SQLAlchemy + SQLite | Persistent session storage |
+| Twilio | WhatsApp webhook integration |
 | Pydantic | Request/response validation |
-| python-dotenv | Loads `.env` file |
 
 ---
 
 ## Setup
 
-### 1. Clone the repo
+### 1. Clone and install
 
 ```bash
 git clone <your-repo-url>
 cd productivity_agent
-```
-
-### 2. Create and activate a virtual environment
-
-```bash
 python -m venv .venv
 
 # Windows
 .venv\Scripts\activate
-
 # Mac/Linux
 source .venv/bin/activate
-```
 
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 4. Add your API key
+### 2. Configure environment variables
 
 Create a `.env` file in the project root:
 
-```
-ANTHROPIC_API_KEY=your_key_here
+```env
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_PLACES_API_KEY=AIzaSy...       # optional — enables place search
+TWILIO_ACCOUNT_SID=AC...              # optional — enables WhatsApp
+TWILIO_AUTH_TOKEN=...                 # optional — enables WhatsApp
 ```
 
-Get your key at [console.anthropic.com](https://console.anthropic.com).
+### 3. Set up Google Calendar (optional)
 
-### 5. Start the server
+1. Create a Google Cloud project and enable the Google Calendar API
+2. Download OAuth2 credentials as `credentials.json` and place it in the project root
+3. Run the auth script once to generate `token.json`:
+
+```bash
+python setup_calendar.py
+```
+
+### 4. Start the server
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
+Open `http://127.0.0.1:8000` for the web chat UI, or `http://127.0.0.1:8000/docs` for the Swagger API explorer.
+
 ---
 
-## Usage
-
-Open `http://127.0.0.1:8000/docs` in your browser.
-
-Use the **POST /run** endpoint with a JSON body:
-
-```json
-{
-  "goal": "Prepare for a Python job interview next week",
-  "context": "I have 2 hours per day available"
-}
-```
-
-### Example response
-
-```json
-{
-  "status": "ok",
-  "plan": [
-    {
-      "id": 1,
-      "title": "Review Python fundamentals",
-      "description": "Go through data types, loops, functions, and OOP concepts",
-      "estimated_minutes": 60,
-      "priority": "high"
-    }
-  ],
-  "execution_results": [
-    "Plan covers all major interview topics in logical order",
-    "Time budget fits within 2 hours/day across 5 days"
-  ],
-  "critique": "[Score: 8/10 | Quality: good] This plan is thorough and ready to execute.",
-  "final_summary": "Goal: Prepare for a Python job interview...\nTasks: 5 | Estimated time: 4.0 hours\nStart with: Review Python fundamentals"
-}
-```
-
-### Endpoints
+## API endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Check the server is running |
-| POST | `/run` | Run the full multi-agent pipeline |
-| GET | `/docs` | Interactive API documentation (Swagger UI) |
+| `GET` | `/health` | Server health check |
+| `POST` | `/chat/new` | Create a new session, returns `session_id` |
+| `POST` | `/chat` | Send a message in an existing session |
+| `POST` | `/run` | Legacy single-shot planning pipeline |
+| `POST` | `/webhook/whatsapp` | Twilio WhatsApp webhook |
+
+### Chat request
+
+```json
+POST /chat
+{
+  "session_id": "abc123",
+  "message": "add yoga on Friday at 7am",
+  "location": { "lat": 32.08, "lng": 34.78 }
+}
+```
+
+### Chat response
+
+```json
+{
+  "session_id": "abc123",
+  "assistant_message": "Done — added Yoga on Fri May 01 at 07:00 to your calendar.",
+  "structured_data": { "event": { ... } },
+  "action": "event_created"
+}
+```
+
+### Supported actions (in `action` field)
+
+| Action | Triggered by |
+|---|---|
+| `event_created` | "add X on Y at Z" |
+| `event_deleted` | "delete X" (after confirmation) |
+| `delete_range_done` | "remove all yoga events this week" (after confirmation) |
+| `delete_preview` | Preview shown before any delete |
+| `replace_event` | "change X to Y at Z" |
+| `calendar_shown` | "what's on my calendar?" |
+| `places_shown` | "find an Italian restaurant near Tel Aviv" |
+| `plan_delivered` | Goal-based planning request |
+| `needs_context` | Missing info — agent asks a clarifying question |
+| `cancelled` | User said no to a pending delete |
 
 ---
 
-## Error handling
+## Calendar features
 
-- Empty goal → `400 Bad Request`
-- Missing API key → `500` with a clear message
-- Any agent failure → returns `"status": "error"` with a description instead of crashing
+- **Create event** — "add standup on Monday at 9am"
+- **Delete event** — "delete my math test" (previews first, then confirms)
+- **Delete range** — "remove all yoga events from May 1 to May 5" (filtered by title + date range, confirms before deleting)
+- **Replace event** — "move yoga to Tuesday at 8am"
+- **Check calendar** — "what do I have this week?"
+- **Conflict detection** — warns if a new event overlaps an existing one
+- **Timezone** — Asia/Jerusalem (UTC+3, Israel)
 
 ---
 
-## How the agents work together
+## WhatsApp
 
-The key design decision is that **no agent knows about the others**. Each one just takes an input and returns a dict. The `Orchestrator` is the only place that knows the order and how to pass data between them. This makes each agent easy to test, replace, or extend independently.
+Point your Twilio sandbox webhook at:
+
+```
+POST https://<your-domain>/webhook/whatsapp
+```
+
+Each phone number gets a persistent session. Messages survive server restarts via SQLite.
+
+---
+
+## Key design decisions
+
+- **No agent knows about the others** — each agent takes an input and returns a dict; only the orchestrator knows the order
+- **Confirmation before destructive actions** — deletes always preview what will be removed and ask for confirmation
+- **Context enrichment** — calendar events, weather, and Jewish holidays are injected into every planning request so Claude can avoid conflicts and respect constraints
+- **Services are optional** — the server starts and runs even if Google Calendar, Places, or Twilio credentials are missing; those features are simply unavailable
+- **Session persistence** — `SQLiteSessionStore` keeps conversation history across server restarts; `InMemorySessionStore` is available for testing
