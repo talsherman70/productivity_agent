@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from app.core.llm_client import LLMClient
 from app.core.conversation import ConversationHistory
 from app.core.session_store import AbstractSessionStore, session_store as default_store
@@ -9,7 +9,7 @@ from app.orchestrator.coordinator import Orchestrator
 # ── System prompts ────────────────────────────────────────────────────────────
 
 def get_intent_system_prompt() -> str:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d")
     return f"""
 You are a conversation router for a productivity assistant with Google Calendar and Google Places access.
 
@@ -17,7 +17,7 @@ Read the conversation history and classify the user's latest message.
 
 Respond with ONLY a valid JSON object — no extra text:
 {{
-    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "check_weather" | "question" | "other",
+    "intent": "new_goal" | "needs_context" | "confirmation" | "rejection" | "refinement" | "create_event" | "replace_event" | "delete_event" | "check_calendar" | "search_places" | "select_place" | "ask_distances" | "check_weather" | "question" | "other",
     "goal": "the user's productivity goal if one exists, otherwise empty string",
     "context": "any useful context from the full conversation (preferences, constraints, answers), otherwise empty string",
     "calendar_event": {{
@@ -50,26 +50,32 @@ Intent definitions:
 - rejection: user is saying no, cancel, or stop
 - refinement: user wants to change or adjust the current goal or plan
 - create_event: user wants to add something to their calendar AND you have title + date + time
+- replace_event: user wants to replace/reschedule an existing event with a new one (e.g. "replace X with Y", "change X to Y", "move X to Y")
 - check_calendar: user wants to see what is on their calendar
 - search_places: user wants to find a place (restaurant, cafe, gym, etc.)
-- select_place: user is picking one of the places shown in the previous assistant message (e.g. "the first one", "number 2", "add that to my calendar")
+- select_place: user is picking one of the places shown in the previous assistant message
 - delete_event: user wants to remove an event from their calendar
 - check_weather: user wants to know the weather for a location or date
-- ask_distances: user is asking how far the listed places are (e.g. "how far are they?", "what are the distances?", "which is closest?")
+- ask_distances: user is asking how far the listed places are
 - question: user is asking a general question
 - other: greetings, thanks, unrelated messages
 
 Rules:
 - Use needs_context if the user wants to create a calendar event but date or time is missing
 - Only use create_event when you have title, date, AND time
+- Use replace_event when the user says "replace X with Y", "change X to Y at Z", "move X to Y", "reschedule X to Y" — populate BOTH delete_query (old event) AND calendar_event (new event)
 - Use search_places when the user wants to find any kind of place or venue
 - Set nearby=true and populate location when the user says "near me" or gives a specific area
 - Set radius_meters based on what the user specifies (e.g. "2 km" → 2000, "500 m" → 500); default 2000
-- Use select_place when the user refers to a place from the previous list (e.g. "book the second one", "add it to my calendar")
+- Use select_place when the user refers to a place from the previous list
 - selected_place_index is 0-based (first = 0, second = 1, etc.), null if not applicable
-- The calendar_event field is only required when intent is create_event, otherwise omit it or leave it empty
+- The calendar_event field is only required when intent is create_event or replace_event
 - Convert relative dates to absolute dates (today is {today})
-- Always output times in LOCAL 24-hour format — do NOT convert to UTC (e.g. "5pm" → "17:00", "9am" → "09:00")
+
+TIME RULES — output the local time the user stated, converted to 24-hour. No UTC conversion. The system handles timezone internally.
+- "6am" → "06:00", "9am" → "09:00", "11am" → "11:00"
+- "12pm" → "12:00", "1pm" → "13:00", "5pm" → "17:00", "9pm" → "21:00"
+- "3:30pm" → "15:30", "7:45am" → "07:45"
 - duration_minutes defaults to 60 if not specified
 
 Always accumulate context from the full conversation history.
@@ -78,16 +84,20 @@ Always accumulate context from the full conversation history.
 
 CONVERSATIONAL_SYSTEM_PROMPT = """
 You are a helpful personal assistant. You help users plan, organise, and manage their time.
-You are connected to the user's Google Calendar and Google Places.
-You can read events, create events, delete events, and search for places.
 
-Be warm, clear, and concise. Do not use filler phrases like "Certainly!" or "Of course!".
-Get straight to the point.
+IMPORTANT — what you can and cannot do in this context:
+- You CANNOT execute calendar or places operations yourself. The system handles those automatically.
+- NEVER say "I've added X to your calendar", "I've deleted X", "Done!", or similar — only the system can confirm completed actions. If you say it, you are lying.
+- If the user wants to add a calendar event but you are missing the title, date, or time — ask ONE specific question to get the missing piece.
+- If the user wants to delete an event but didn't name it — ask which event.
+- If you truly cannot route the request, say: "Could you rephrase that? For example: 'add [title] on [date] at [time]' or 'delete my [event name]'."
 
-When you need more information, ask ONE specific question at a time.
-Never ask multiple questions at once.
-When a user says no or rejects something, acknowledge it briefly and ask what they'd like instead.
-When asked a question, answer it directly.
+What you CAN do here:
+- Ask ONE clarifying question to collect missing information
+- Answer general questions
+- Acknowledge rejections and ask what the user wants instead
+
+Be warm, clear, and concise. No filler phrases. Never ask multiple questions at once.
 """.strip()
 
 
@@ -97,7 +107,7 @@ class ConversationalOrchestrator:
     def __init__(self, store: AbstractSessionStore = None):
         self.store = store or default_store
         self.llm = LLMClient(model="claude-haiku-4-5-20251001")
-        self.fast_llm = LLMClient(model="claude-haiku-4-5-20251001")
+        self.fast_llm = LLMClient(model="claude-sonnet-4-6")
         self.pipeline = Orchestrator()
 
         from app.services.calendar_service import calendar_service
@@ -113,6 +123,17 @@ class ConversationalOrchestrator:
         self.jewish_calendar = jewish_calendar_service
 
     def run(self, session_id: str, user_message: str, location: dict = None) -> dict:
+        try:
+            return self._run(session_id, user_message, location)
+        except Exception:
+            return {
+                "session_id": session_id,
+                "assistant_message": "Something went wrong. Please try again.",
+                "structured_data": None,
+                "action": "error",
+            }
+
+    def _run(self, session_id: str, user_message: str, location: dict = None) -> dict:
         history = self.store.get_history(session_id)
         if history is None:
             return {
@@ -139,14 +160,33 @@ class ConversationalOrchestrator:
         selected_index = intent_data.get("selected_place_index")
 
         # ── Route ─────────────────────────────────────────────────────────────
-        if intent in ("new_goal", "confirmation", "refinement") and goal:
-            response = self._handle_pipeline(goal, context)
+        if intent == "create_event":
+            if calendar_event and calendar_event.get("title") and calendar_event.get("date") and calendar_event.get("time"):
+                response = self._handle_create_event(calendar_event)
+            else:
+                # Intent detected but fields incomplete — ask for what's missing
+                missing = [f for f in ("title", "date", "time") if not (calendar_event or {}).get(f)]
+                response = {
+                    "assistant_message": f"I need a bit more to add that. Could you give me the {' and '.join(missing)}?",
+                    "structured_data": None,
+                    "action": "needs_context",
+                }
 
-        elif intent == "create_event" and calendar_event:
-            response = self._handle_create_event(calendar_event)
+        elif intent == "replace_event":
+            response = self._handle_replace_event(delete_query, calendar_event)
 
         elif intent == "delete_event":
-            response = self._handle_delete_event(delete_query)
+            if delete_query.get("title") or delete_query.get("date"):
+                response = self._handle_delete_event(delete_query)
+            else:
+                response = {
+                    "assistant_message": "Which event would you like to delete? Give me the name and optionally the date.",
+                    "structured_data": None,
+                    "action": "needs_context",
+                }
+
+        elif intent in ("new_goal", "confirmation", "refinement") and goal:
+            response = self._handle_pipeline(goal, context)
 
         elif intent == "check_calendar":
             response = self._handle_check_calendar()
@@ -172,8 +212,11 @@ class ConversationalOrchestrator:
         else:
             response = self._handle_other(history)
 
-        history.add_assistant(response["assistant_message"])
-        self.store.save_history(session_id, history)
+        try:
+            history.add_assistant(response["assistant_message"])
+            self.store.save_history(session_id, history)
+        except Exception:
+            pass
 
         response["session_id"] = session_id
         return response
@@ -481,7 +524,7 @@ class ConversationalOrchestrator:
 
         try:
             events = self.calendar.get_upcoming_events(days=30)
-            words = [w for w in title_query.split() if len(w) > 2]
+            words = [w for w in title_query.split() if len(w) >= 2]
             matches = [
                 e for e in events
                 if all(w in e.get("summary", "").lower() for w in words)
@@ -515,9 +558,43 @@ class ConversationalOrchestrator:
 
         except Exception:
             return {
-                "assistant_message": "Something went wrong with the calendar. Try again?",
+                "assistant_message": "Something went wrong while deleting. Try again?",
                 "structured_data": None,
                 "action": "error"
+            }
+
+    def _handle_replace_event(self, delete_query: dict, calendar_event: dict) -> dict:
+        """Delete an existing event then create a replacement in one step."""
+        if not delete_query.get("title"):
+            return {
+                "assistant_message": "Which event would you like to replace? Give me the name of the old event and the details for the new one.",
+                "structured_data": None,
+                "action": "needs_context",
+            }
+
+        # Step 1: delete the old event
+        delete_response = self._handle_delete_event(delete_query)
+        if delete_response.get("action") not in ("event_deleted",):
+            # Couldn't find / delete — surface that message so the user knows
+            return delete_response
+
+        # Step 2: create the new event (if we have enough info)
+        if calendar_event and calendar_event.get("title") and calendar_event.get("date") and calendar_event.get("time"):
+            create_response = self._handle_create_event(calendar_event)
+            if create_response.get("action") == "event_created":
+                return {
+                    "assistant_message": f"Done — removed the old event and {create_response['assistant_message'].replace('Done! Added', 'added')}",
+                    "structured_data": create_response.get("structured_data"),
+                    "action": "event_replaced",
+                }
+            return create_response
+        else:
+            # Old event deleted but no new details — ask for them
+            old_title = delete_query.get("title", "the event")
+            return {
+                "assistant_message": f"Removed \"{old_title}\". What should the new event be — title, date, and time?",
+                "structured_data": None,
+                "action": "needs_context",
             }
 
     def _handle_check_weather(self, weather_query: dict) -> dict:

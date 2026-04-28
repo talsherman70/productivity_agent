@@ -1,6 +1,5 @@
 import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -15,11 +14,15 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 CREDENTIALS_PATH = os.path.join(PROJECT_ROOT, "credentials.json")
 TOKEN_PATH = os.path.join(PROJECT_ROOT, "token.json")
 
+# Hardcoded Israel Daylight Time (UTC+3, used April–October).
+# For a production app this should use ZoneInfo("Asia/Jerusalem") to handle DST.
+_ISRAEL_TZ = timezone(timedelta(hours=3))
+
 
 class CalendarService:
     def __init__(self):
         self.service = self._authenticate()
-        self.tz = ZoneInfo(TIMEZONE)
+        self.tz = _ISRAEL_TZ
 
     def _authenticate(self):
         if not os.path.exists(CREDENTIALS_PATH):
@@ -44,6 +47,24 @@ class CalendarService:
 
         return build("calendar", "v3", credentials=creds)
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _make_aware(self, date: str, time: str) -> datetime:
+        """
+        Parse the time the LLM output (local Israel time) and add 3h so that
+        Google Calendar stores the correct absolute time.
+        """
+        naive = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+        return (naive + timedelta(hours=3)).replace(tzinfo=self.tz)
+
+    @staticmethod
+    def _parse_google_dt(dt_str: str) -> datetime:
+        """
+        Parse a datetime string returned by the Google Calendar API.
+        Handles both RFC3339 offset format ("...+03:00") and UTC "Z" suffix.
+        """
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
     # ── Read ──────────────────────────────────────────────────────────────────
 
     def get_upcoming_events(self, days: int = 7) -> list:
@@ -61,7 +82,7 @@ class CalendarService:
         return result.get("items", [])
 
     def check_conflicts(self, date: str, time: str, duration_minutes: int = 60) -> list:
-        start_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(tzinfo=self.tz)
+        start_dt = self._make_aware(date, time)
         end_dt = start_dt + timedelta(minutes=duration_minutes)
 
         result = self.service.events().list(
@@ -83,14 +104,17 @@ class CalendarService:
         duration_minutes: int = 60,
         description: str = "",
     ) -> dict:
-        start_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(tzinfo=self.tz)
+        # Send a naive datetime string (no UTC offset) + timeZone so Google
+        # interprets the time as local Israel time directly.
+        start_dt = self._make_aware(date, time)
         end_dt = start_dt + timedelta(minutes=duration_minutes)
+        fmt = "%Y-%m-%dT%H:%M:%S"
 
         event_body = {
             "summary": title,
             "description": description,
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
+            "start": {"dateTime": start_dt.strftime(fmt), "timeZone": TIMEZONE},
+            "end": {"dateTime": end_dt.strftime(fmt), "timeZone": TIMEZONE},
         }
 
         return self.service.events().insert(
@@ -114,7 +138,11 @@ class CalendarService:
             title = event.get("summary", "Untitled")
             start = event["start"].get("dateTime", event["start"].get("date", ""))
             if "T" in start:
-                formatted_time = datetime.fromisoformat(start).astimezone(self.tz).strftime("%a %b %d at %H:%M")
+                try:
+                    dt = self._parse_google_dt(start).astimezone(self.tz) - timedelta(hours=3)
+                    formatted_time = dt.strftime("%a %b %d at %H:%M")
+                except Exception:
+                    formatted_time = start
             else:
                 formatted_time = start
             lines.append(f"- {title}: {formatted_time}")
@@ -125,8 +153,11 @@ class CalendarService:
         title = event.get("summary", "Event")
         start = event["start"].get("dateTime", "")
         if start:
-            dt = datetime.fromisoformat(start).astimezone(self.tz)
-            return f"{title} on {dt.strftime('%a %b %d at %H:%M')}"
+            try:
+                dt = self._parse_google_dt(start).astimezone(self.tz) - timedelta(hours=3)
+                return f"{title} on {dt.strftime('%a %b %d at %H:%M')}"
+            except Exception:
+                pass
         return title
 
 
